@@ -1,0 +1,20 @@
+{
+  "interval_seconds": 10,
+  "timeout_seconds": 1.0,
+  "retention_days": 30,
+  "bind": "0.0.0.0",
+  "port": 8787,
+
+  "targets": [
+    {"id": "gateway",  "name": "Router oficina",      "kind": "control", "method": "icmp", "host": "auto"},
+    {"id": "internet", "name": "Internet (1.1.1.1)",  "kind": "control", "method": "icmp", "host": "1.1.1.1"},
+
+    {"id": "server",   "name": "Servidor RTMP actual", "kind": "server", "method": "tcp",  "host": "CAMBIAR.example.com", "port": 1935},
+
+    {"id": "mx-central-1", "name": "México (mx-central-1)",      "kind": "region", "method": "tcp", "host": "dynamodb.mx-central-1.amazonaws.com", "port": 443},
+    {"id": "us-east-1",    "name": "N. Virginia (us-east-1)",    "kind": "region", "method": "tcp", "host": "dynamodb.us-east-1.amazonaws.com",    "port": 443},
+    {"id": "us-east-2",    "name": "Ohio (us-east-2)",           "kind": "region", "method": "tcp", "host": "dynamodb.us-east-2.amazonaws.com",    "port": 443},
+    {"id": "us-west-1",    "name": "N. California (us-west-1)",  "kind": "region", "method": "tcp", "host": "dynamodb.us-west-1.amazonaws.com",    "port": 443},
+    {"id": "us-west-2",    "name": "Oregón (us-west-2)",         "kind": "region", "method": "tcp", "host": "dynamodb.us-west-2.amazonaws.com",    "port": 443}
+  ]
+}

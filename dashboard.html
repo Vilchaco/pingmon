@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Latencia a AWS</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11,11,11,0.10);
+  --series: #2a78d6;
+  --band: #b7d3f6;
+  --good: #0ca30c;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+  --seq-0: #cde2fb; --seq-1: #9ec5f4; --seq-2: #6da7ec; --seq-3: #3987e5;
+  --seq-4: #256abf; --seq-5: #184f95; --seq-6: #0d366b;
+  --empty: #f0efec;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+    --series: #3987e5; --band: #184f95; --empty: #262624;
+    --seq-0: #0d366b; --seq-1: #104281; --seq-2: #184f95; --seq-3: #256abf;
+    --seq-4: #3987e5; --seq-5: #6da7ec; --seq-6: #b7d3f6;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+  --series: #3987e5; --band: #184f95; --empty: #262624;
+  --seq-0: #0d366b; --seq-1: #104281; --seq-2: #184f95; --seq-3: #256abf;
+  --seq-4: #3987e5; --seq-5: #6da7ec; --seq-6: #b7d3f6;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+main { max-width: 1180px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 22px; margin: 0 0 4px; font-weight: 650; }
+h2 { font-size: 15px; margin: 32px 0 4px; font-weight: 650; }
+.sub { color: var(--ink-2); margin: 0 0 12px; }
+.note { color: var(--muted); font-size: 12px; }
+.bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 16px 0; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface); }
+.seg button {
+  border: 0; background: none; color: var(--ink-2); padding: 6px 12px; font: inherit; cursor: pointer;
+}
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button[aria-pressed="true"] { color: var(--ink); font-weight: 650; background: var(--empty); }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+.verdict { display: flex; gap: 14px; align-items: flex-start; }
+.verdict .icon { flex: none; width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; color: #fff; font-weight: 700; }
+.verdict .title { font-size: 17px; font-weight: 650; margin: 0 0 4px; }
+.verdict p { margin: 0; color: var(--ink-2); }
+.warn { margin-top: 12px; padding: 10px 12px; border-radius: 8px; background: var(--empty); color: var(--ink-2); font-size: 13px; }
+.warn b { color: var(--ink); }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { padding: 7px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--grid); }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+th:first-child, td:first-child { text-align: left; }
+tr.group td { color: var(--muted); font-size: 12px; padding-top: 14px; border-bottom: 0; }
+.badge { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 6px; margin-left: 6px; border: 1px solid var(--border); color: var(--ink-2); }
+.bad { color: var(--critical); font-weight: 600; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
+.mini h3 { margin: 0; font-size: 13px; font-weight: 600; }
+.mini .meta { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+svg text { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; color: var(--ink-2); font-size: 12px; margin: 8px 0 12px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.key { display: inline-block; width: 16px; }
+.tip {
+  position: fixed; pointer-events: none; z-index: 10; display: none;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.12); min-width: 150px;
+  font-variant-numeric: tabular-nums;
+}
+.tip .t { color: var(--muted); margin-bottom: 4px; }
+.tip .row { display: flex; justify-content: space-between; gap: 16px; }
+.tip .row b { color: var(--ink); }
+.tip .row span { color: var(--ink-2); }
+.heat { overflow-x: auto; }
+.heat table td { padding: 0; border: 2px solid var(--surface); height: 22px; min-width: 22px; }
+.heat table td.name { padding: 0 10px 0 0; text-align: left; font-size: 12px; color: var(--ink-2); border: 0; }
+.heat table th { padding: 2px 0; text-align: center; font-size: 10px; }
+.scale { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); margin-top: 8px; flex-wrap: wrap; }
+.scale i { display: inline-block; width: 22px; height: 10px; border-radius: 2px; }
+.loading { opacity: .5; transition: opacity .2s; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Latencia oficina → AWS</h1>
+  <p class="sub">RTT de conexión TCP a cada región y al servidor RTMP, con el router y un destino de internet como referencia. <span id="updated" class="note"></span></p>
+
+  <div class="bar">
+    <div class="seg" id="windows" role="group" aria-label="Ventana de tiempo">
+      <button data-w="1h">1 h</button><button data-w="6h">6 h</button>
+      <button data-w="24h">24 h</button><button data-w="7d">7 días</button>
+      <button data-w="30d">30 días</button>
+    </div>
+  </div>
+
+  <div id="root">
+    <section class="card verdict" id="verdict"></section>
+
+    <h2>Ranking</h2>
+    <p class="sub">Score = p95 + 2 × jitter + 50 ms por cada 1 % de pérdida. Menor es mejor. Para RTMP (TCP) la pérdida y los picos pesan más que la latencia media.</p>
+    <div class="card tablewrap"><table id="rank"></table></div>
+
+    <h2>Evolución</h2>
+    <p class="sub">Misma escala en todos los paneles. Los picos que aparecen a la vez en el router o en internet y en AWS son de la red de la oficina.</p>
+    <div class="legend">
+      <span><svg class="key" viewBox="0 0 16 8" height="8"><line x1="0" y1="4" x2="16" y2="4" stroke="var(--series)" stroke-width="2"/></svg>mediana (p50)</span>
+      <span><svg class="key" viewBox="0 0 16 8" height="8"><rect width="16" height="8" rx="2" fill="var(--band)"/></svg>p50–p95</span>
+      <span><svg class="key" viewBox="0 0 16 8" height="8"><rect x="6" width="4" height="8" rx="1" fill="var(--critical)"/></svg>pérdida (sin respuesta en 1 s)</span>
+    </div>
+    <div class="grid" id="multiples"></div>
+
+    <h2>Por hora del día (p95)</h2>
+    <p class="sub">Para ver si el lag se concentra a ciertas horas (p. ej. durante las emisiones o cuando la oficina está llena).</p>
+    <div class="card heat" id="heat"></div>
+  </div>
+</main>
+<div class="tip" id="tip"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const el = (tag, attrs = {}, text) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (text != null) e.textContent = text;
+  return e;
+};
+const SVGNS = "http://www.w3.org/2000/svg";
+const sv = (tag, attrs = {}) => {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  return e;
+};
+const ms = v => v == null ? "—" : (v < 10 ? v.toFixed(1) : Math.round(v)) + " ms";
+const pc = v => v == null ? "—" : (v * 100).toFixed(v < 0.01 && v > 0 ? 2 : 1) + " %";
+const KIND = { control: "Referencia", server: "Servidor actual", region: "Regiones AWS" };
+
+let win = "24h";
+try { win = localStorage.getItem("pingmon.window") || win; } catch (e) {}
+let data = null;
+
+function fmtTime(ts, window) {
+  const d = new Date(ts * 1000);
+  const hm = d.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
+  if (window <= 86400) return hm;
+  return d.toLocaleDateString("es-ES", { day: "numeric", month: "short" }) + " " + hm;
+}
+
+async function load() {
+  $("#root").classList.add("loading");
+  document.querySelectorAll("#windows button").forEach(b => b.setAttribute("aria-pressed", b.dataset.w === win));
+  try {
+    const r = await fetch("/api/data?window=" + win);
+    if (!r.ok) throw new Error(await r.text());
+    data = await r.json();
+    render();
+    $("#updated").textContent = "Actualizado " + new Date(data.generated * 1000).toLocaleTimeString("es-ES") + " · se refresca cada minuto.";
+  } catch (e) {
+    $("#updated").textContent = "Error cargando datos: " + e.message;
+  }
+  $("#root").classList.remove("loading");
+}
+
+document.querySelectorAll("#windows button").forEach(b => b.addEventListener("click", () => {
+  win = b.dataset.w;
+  try { localStorage.setItem("pingmon.window", win); } catch (e) {}
+  load();
+}));
+
+const name = id => (data.targets.find(t => t.id === id) || { name: id }).name;
+
+function render() {
+  renderVerdict();
+  renderRank();
+  renderMultiples();
+  renderHeat();
+}
+
+function renderVerdict() {
+  const v = data.verdict, box = $("#verdict");
+  box.replaceChildren();
+  const S = {
+    nodata: ["var(--muted)", "…", "Aún no hay datos suficientes", "Deja el monitor corriendo; en unos minutos empieza a haber señal y en unos días, patrón."],
+    stable: ["var(--good)", "✓", "Sin episodios de lag hacia AWS", "En esta ventana ningún tramo ha superado el doble de la latencia normal ni ha tenido pérdidas relevantes."],
+    local: ["var(--critical)", "!", "El lag viene de la red de la oficina", "La mayoría de los episodios de lag hacia AWS coinciden con lag hacia el router o internet. Cambiar de región no lo resolverá: revisa el ancho de subida, el Wi-Fi o la saturación de la línea durante las emisiones."],
+    aws: ["var(--serious)", "!", "El lag está en el camino hacia AWS", "Los episodios aparecen hacia AWS mientras la red local está limpia. Aquí sí tiene sentido comparar regiones."],
+    mixed: ["var(--warning)", "!", "Causas mezcladas", "Parte de los episodios coinciden con lag local y parte solo aparecen hacia AWS."],
+  }[v.state];
+  const icon = el("div", { class: "icon", "aria-hidden": "true" }, S[1]);
+  icon.style.background = S[0];
+  const body = el("div");
+  body.append(el("p", { class: "title" }, S[2]), el("p", {}, S[3]));
+  if (v.episodes) {
+    const ref = v.reference === "server" ? "el servidor RTMP" : "la mayoría de regiones";
+    body.append(el("p", { class: "note", style: "margin-top:8px" },
+      `${v.episodes} tramos con lag hacia ${ref}; ${v.local} coinciden con lag local (${v.lan} ya en el propio router).`));
+  }
+  if (v.best_region) {
+    const s = data.summary[v.best_region];
+    body.append(el("p", { class: "note", style: "margin-top:4px" },
+      `Mejor región en esta ventana: ${name(v.best_region)} · p95 ${ms(s.p95)} · pérdida ${pc(s.loss)}.`));
+  }
+  const warns = [];
+  if (data.unconfigured.includes("server"))
+    warns.push(["Servidor RTMP sin configurar. ", "Pon su host en config.json (objetivo \"server\") para medir el camino real de la señal; mientras tanto el diagnóstico usa las regiones."]);
+  for (const id of (v.ignored_servers || []))
+    warns.push([`${name(id)} no responde desde esta máquina. `, "Probablemente el Security Group o una whitelist solo admite al encoder: añade la IP pública de esta máquina en el puerto RTMP. Mientras tanto el diagnóstico usa las regiones."]);
+  for (const id of (v.ignored_controls || []))
+    warns.push([`${name(id)} no responde a ping. `, id === "gateway"
+      ? "Se excluye del diagnóstico. Suele ser el permiso de Red local de macOS: Ajustes del Sistema → Privacidad y seguridad → Red local → activa python3 (o Terminal). Si ya está activado, es el router el que filtra el ping."
+      : "Se excluye del diagnóstico."]);
+  if (data.stalled_rounds)
+    warns.push([`${data.stalled_rounds} rondas descartadas. `, "El propio equipo se congeló (todos los destinos dieron el mismo retraso a la vez). No es la red; si pasa mucho, revisa que el Mac mini no entre en reposo."]);
+  if (warns.length) {
+    const w = el("div", { class: "warn" });
+    for (const [b, t] of warns) { const p = el("div"); p.append(el("b", {}, b), document.createTextNode(t)); w.append(p); }
+    body.append(w);
+  }
+  box.append(icon, body);
+}
+
+function renderRank() {
+  const t = $("#rank"); t.replaceChildren();
+  const head = el("tr");
+  ["Objetivo", "p50", "p95", "p99", "máx", "jitter", "pérdida", "score", "muestras"].forEach(h => head.append(el("th", {}, h)));
+  t.append(head);
+  for (const kind of ["control", "server", "region"]) {
+    const rows = data.targets.filter(x => x.kind === kind)
+      .sort((a, b) => (data.summary[a.id].score ?? 1e9) - (data.summary[b.id].score ?? 1e9));
+    if (!rows.length) continue;
+    const g = el("tr", { class: "group" }); g.append(el("td", { colspan: 9 }, KIND[kind])); t.append(g);
+    for (const x of rows) {
+      const s = data.summary[x.id], tr = el("tr");
+      const c = el("td", {}, x.name);
+      if (x.id === data.verdict.best_region) c.append(el("span", { class: "badge" }, "mejor"));
+      tr.append(c);
+      [ms(s.p50), ms(s.p95), ms(s.p99), ms(s.max), ms(s.jitter)].forEach(v => tr.append(el("td", {}, v)));
+      tr.append(el("td", s.loss >= 0.01 ? { class: "bad" } : {}, pc(s.loss)));
+      tr.append(el("td", {}, s.score == null ? "—" : Math.round(s.score)));
+      tr.append(el("td", {}, s.n.toLocaleString("es-ES")));
+      t.append(tr);
+    }
+  }
+}
+
+// ---------- small multiples with a synced crosshair
+const W = 340, H = 120, M = { l: 34, r: 6, t: 6, b: 18 };
+let panels = [];
+
+function renderMultiples() {
+  const box = $("#multiples"); box.replaceChildren(); panels = [];
+  const nb = data.series[data.targets[0]?.id]?.p50.length || 0;
+  if (!nb) return;
+  // Escala común; limitada al p95 más alto para que un pico aislado no aplaste todo.
+  let ymax = 0;
+  for (const t of data.targets) for (const v of data.series[t.id].p95) if (v != null && data.summary[t.id].loss < 0.5) ymax = Math.max(ymax, v);
+  ymax = niceMax(ymax * 1.1 || 50);
+  const x = i => M.l + (W - M.l - M.r) * (i + 0.5) / nb;
+  const y = v => M.t + (H - M.t - M.b) * (1 - Math.min(v, ymax) / ymax);
+  const order = ["control", "server", "region"];
+  const targets = [...data.targets].sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind));
+
+  for (const t of targets) {
+    const s = data.series[t.id], sum = data.summary[t.id];
+    const card = el("div", { class: "card mini" });
+    card.append(el("h3", {}, t.name), el("div", { class: "meta" }, `p50 ${ms(sum.p50)} · p95 ${ms(sum.p95)} · pérdida ${pc(sum.loss)}`));
+    const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `Latencia de ${t.name}` });
+    for (const f of [0, 0.5, 1]) {
+      const yy = y(ymax * f);
+      svg.append(sv("line", { x1: M.l, x2: W - M.r, y1: yy, y2: yy, stroke: f === 0 ? "var(--axis)" : "var(--grid)", "stroke-width": 1 }));
+      const lab = sv("text", { x: M.l - 4, y: yy + 3, "text-anchor": "end" }); lab.textContent = Math.round(ymax * f); svg.append(lab);
+    }
+    for (const i of [0, Math.floor(nb / 2), nb - 1]) {
+      const lab = sv("text", { x: x(i), y: H - 4, "text-anchor": i === 0 ? "start" : i === nb - 1 ? "end" : "middle" });
+      lab.textContent = fmtTime(data.start + data.bucket * i, data.window); svg.append(lab);
+    }
+    // banda p50–p95 y línea p50, cortadas donde no hay datos
+    let band = "", line = "";
+    for (const run of runs(s.p50)) {
+      band += "M" + run.map(i => `${x(i)},${y(s.p95[i] ?? s.p50[i])}`).join("L") +
+              "L" + run.slice().reverse().map(i => `${x(i)},${y(s.p50[i])}`).join("L") + "Z";
+      line += "M" + run.map(i => `${x(i)},${y(s.p50[i])}`).join("L");
+    }
+    svg.append(sv("path", { d: band, fill: "var(--band)", opacity: 0.8 }));
+    svg.append(sv("path", { d: line, fill: "none", stroke: "var(--series)", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    // pérdida: marcas en la base, altura según el % perdido
+    const bw = Math.max(2, (W - M.l - M.r) / nb - 1);
+    s.loss.forEach((l, i) => {
+      if (!l) return;
+      const h = 3 + 12 * Math.min(1, l / 0.2);
+      svg.append(sv("rect", { x: x(i) - bw / 2, y: H - M.b - h, width: bw, height: h, rx: 1, fill: "var(--critical)" }));
+    });
+    const cross = sv("line", { y1: M.t, y2: H - M.b, stroke: "var(--ink-2)", "stroke-width": 1, visibility: "hidden" });
+    svg.append(cross);
+    const hit = sv("rect", { x: M.l, y: 0, width: W - M.l - M.r, height: H, fill: "transparent", tabindex: 0 });
+    svg.append(hit);
+    const panel = { t, svg, cross, x, nb };
+    panels.push(panel);
+    const move = ev => {
+      const r = svg.getBoundingClientRect();
+      const px = (ev.clientX - r.left) * W / r.width;
+      const i = Math.max(0, Math.min(nb - 1, Math.floor((px - M.l) / (W - M.l - M.r) * nb)));
+      hover(panel, i, ev.clientX, ev.clientY);
+    };
+    hit.addEventListener("pointermove", move);
+    hit.addEventListener("pointerleave", unhover);
+    hit.addEventListener("focus", () => { const r = svg.getBoundingClientRect(); hover(panel, nb - 1, r.right, r.top); });
+    hit.addEventListener("blur", unhover);
+    card.append(svg);
+    box.append(card);
+  }
+}
+
+function runs(arr) {
+  const out = []; let cur = [];
+  arr.forEach((v, i) => { if (v == null) { if (cur.length) out.push(cur); cur = []; } else cur.push(i); });
+  if (cur.length) out.push(cur);
+  return out.map(r => r.length === 1 ? [r[0], r[0]] : r);
+}
+
+function niceMax(v) {
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+
+function hover(panel, i, cx, cy) {
+  for (const p of panels) {
+    p.cross.setAttribute("x1", p.x(i)); p.cross.setAttribute("x2", p.x(i));
+    p.cross.setAttribute("visibility", "visible");
+  }
+  const s = data.series[panel.t.id];
+  const tip = $("#tip"); tip.replaceChildren();
+  const t0 = data.start + data.bucket * i;
+  tip.append(el("div", { class: "t" }, `${panel.t.name} · ${fmtTime(t0, data.window)}–${fmtTime(t0 + data.bucket, Math.min(data.window, 86400))}`));
+  const row = (v, l) => { const r = el("div", { class: "row" }); r.append(el("b", {}, v), el("span", {}, l)); tip.append(r); };
+  row(ms(s.p50[i]), "p50"); row(ms(s.p95[i]), "p95"); row(ms(s.max[i]), "máx");
+  row(pc(s.loss[i]), "pérdida"); row(String(s.n[i] || 0), "muestras");
+  placeTip(tip, cx, cy);
+}
+
+function unhover() {
+  for (const p of panels) p.cross.setAttribute("visibility", "hidden");
+  $("#tip").style.display = "none";
+}
+
+function placeTip(tip, cx, cy) {
+  tip.style.display = "block";
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  tip.style.left = Math.min(window.innerWidth - w - 8, cx + 14) + "px";
+  tip.style.top = Math.max(8, Math.min(window.innerHeight - h - 8, cy - h - 10)) + "px";
+}
+
+// ---------- hour-of-day heatmap
+const STEPS = [20, 40, 60, 90, 130, 200];
+const stepColor = v => `var(--seq-${STEPS.findIndex(s => v <= s) === -1 ? 6 : STEPS.findIndex(s => v <= s)})`;
+
+function renderHeat() {
+  const box = $("#heat"); box.replaceChildren();
+  const tb = el("table"), head = el("tr");
+  head.append(el("th"));
+  for (let h = 0; h < 24; h++) head.append(el("th", {}, String(h)));
+  tb.append(head);
+  const order = ["control", "server", "region"];
+  for (const t of [...data.targets].sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind))) {
+    const tr = el("tr"); tr.append(el("td", { class: "name" }, t.name));
+    data.heatmap[t.id].forEach((c, h) => {
+      const td = el("td", { tabindex: 0 });
+      td.style.background = c.p95 == null ? "var(--empty)" : stepColor(c.p95);
+      td.style.borderRadius = "4px";
+      if (c.loss >= 0.02) td.style.boxShadow = "inset 0 0 0 2px var(--critical)";
+      const show = ev => {
+        const tip = $("#tip"); tip.replaceChildren();
+        tip.append(el("div", { class: "t" }, `${t.name} · ${h}:00–${h + 1}:00`));
+        const row = (v, l) => { const r = el("div", { class: "row" }); r.append(el("b", {}, v), el("span", {}, l)); tip.append(r); };
+        row(ms(c.p95), "p95"); row(pc(c.loss), "pérdida"); row(String(c.n), "muestras");
+        const r = td.getBoundingClientRect();
+        placeTip(tip, ev.clientX ?? r.right, ev.clientY ?? r.top);
+      };
+      td.addEventListener("pointermove", show);
+      td.addEventListener("focus", show);
+      td.addEventListener("pointerleave", unhover);
+      td.addEventListener("blur", unhover);
+      tr.append(td);
+    });
+    tb.append(tr);
+  }
+  box.append(tb);
+  const sc = el("div", { class: "scale" });
+  sc.append(el("span", {}, "p95:"));
+  const labels = ["≤20", "≤40", "≤60", "≤90", "≤130", "≤200", ">200 ms"];
+  labels.forEach((l, i) => { const k = el("i"); k.style.background = `var(--seq-${i})`; sc.append(k, el("span", {}, l + "  ")); });
+  const k = el("i"); k.style.boxShadow = "inset 0 0 0 2px var(--critical)"; sc.append(k, el("span", {}, "pérdida ≥ 2 %"));
+  box.append(sc);
+}
+
+load();
+setInterval(load, 60000);
+</script>
+</body>
+</html>
