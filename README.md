@@ -43,6 +43,8 @@ Para que sobreviva a cortes de luz y reinicios, en el Mac mini:
 
 Para cambiar el servidor o las regiones más adelante, edita `~/pingmon/config.json` y reinicia con `python3 ~/pingmon/pingmon.py install`. Para quitarlo: `bash ~/pingmon/desinstalar.command`. Los datos se conservan en `~/pingmon/data`.
 
+Para pasar los datos a otra persona, usa los botones **Exportar resumen (JSON)** y **Muestras (CSV)** del dashboard. Exportan la ventana seleccionada (1 h, 24 h, 7 días…). El resumen pesa poco y trae todo lo que muestra el dashboard; el CSV trae cada medición en bruto.
+
 Informe rápido por terminal:
 ```bash
 python3 ~/pingmon/pingmon.py report --window 7d

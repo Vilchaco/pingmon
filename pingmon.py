@@ -412,10 +412,46 @@ class Handler(BaseHTTPRequestHandler):
                 w = parse_qs(u.query).get("window", ["24h"])[0]
                 body = json.dumps(analyze(parse_window(w))).encode()
                 self._send(200, body, "application/json")
+            elif u.path == "/api/export":
+                q = parse_qs(u.query)
+                self._export(q.get("window", ["7d"])[0], q.get("format", ["json"])[0])
             else:
                 self._send(404, b"not found", "text/plain")
         except Exception as e:
             self._send(500, str(e).encode(), "text/plain")
+
+
+    def _export(self, w, fmt):
+        window_s = parse_window(w)
+        stamp = time.strftime("%Y%m%d-%H%M")
+        if fmt == "csv":
+            # Muestras en bruto, enviadas por partes para no cargar todo en memoria.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition",
+                             'attachment; filename="pingmon-%s-%s.csv"' % (w, stamp))
+            self.end_headers()
+            self.wfile.write(b"fecha,ts,objetivo,rtt_ms\n")
+            conn = db_connect()
+            cur = conn.execute("SELECT ts, target, rtt_ms FROM samples WHERE ts >= ? ORDER BY ts",
+                               (time.time() - window_s,))
+            while True:
+                rows = cur.fetchmany(5000)
+                if not rows:
+                    break
+                self.wfile.write("".join(
+                    "%s,%.3f,%s,%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
+                                         ts, tid, "" if rtt is None else "%.2f" % rtt)
+                    for ts, tid, rtt in rows).encode())
+            conn.close()
+        else:
+            body = json.dumps(analyze(window_s), indent=1).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Disposition",
+                             'attachment; filename="pingmon-%s-%s.json"' % (w, stamp))
+            self.end_headers()
+            self.wfile.write(body)
 
 
 def serve():

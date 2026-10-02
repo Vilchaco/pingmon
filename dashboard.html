@@ -58,7 +58,9 @@ h2 { font-size: 15px; margin: 32px 0 4px; font-weight: 650; }
 .seg button {
   border: 0; background: none; color: var(--ink-2); padding: 6px 12px; font: inherit; cursor: pointer;
 }
-.seg button + button { border-left: 1px solid var(--border); }
+.seg button + button, .seg a + a { border-left: 1px solid var(--border); }
+.seg a.export { color: var(--ink-2); padding: 6px 12px; text-decoration: none; }
+.seg a.export:hover { color: var(--ink); background: var(--empty); }
 .seg button[aria-pressed="true"] { color: var(--ink); font-weight: 650; background: var(--empty); }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
 .verdict { display: flex; gap: 14px; align-items: flex-start; }
@@ -112,6 +114,9 @@ svg text { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nu
       <button data-w="1h">1 h</button><button data-w="6h">6 h</button>
       <button data-w="24h">24 h</button><button data-w="7d">7 días</button>
       <button data-w="30d">30 días</button>
+    </div>
+    <div class="seg" role="group" aria-label="Exportar">
+      <a class="export" id="exp-json" download>Exportar resumen (JSON)</a><a class="export" id="exp-csv" download>Muestras (CSV)</a>
     </div>
   </div>
 
@@ -170,6 +175,8 @@ function fmtTime(ts, window) {
 async function load() {
   $("#root").classList.add("loading");
   document.querySelectorAll("#windows button").forEach(b => b.setAttribute("aria-pressed", b.dataset.w === win));
+  $("#exp-json").href = "/api/export?format=json&window=" + win;
+  $("#exp-csv").href = "/api/export?format=csv&window=" + win;
   try {
     const r = await fetch("/api/data?window=" + win);
     if (!r.ok) throw new Error(await r.text());
