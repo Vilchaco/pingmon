@@ -102,6 +102,14 @@ svg text { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nu
 .scale { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); margin-top: 8px; flex-wrap: wrap; }
 .scale i { display: inline-block; width: 22px; height: 10px; border-radius: 2px; }
 .loading { opacity: .5; transition: opacity .2s; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+.tile-v { font-size: 22px; font-weight: 650; margin: 2px 0 4px; overflow-wrap: anywhere; }
+.audit h3 { font-size: 13px; font-weight: 600; margin: 20px 0 8px; }
+.audit .tablewrap { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 8px 12px; }
+.hours { display: grid; grid-template-columns: repeat(24, 1fr); gap: 2px; align-items: end; height: 72px; }
+.hour { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; }
+.hour i { display: block; width: 100%; max-width: 18px; background: var(--series); border-radius: 4px 4px 0 0; }
+.hour span { font-size: 10px; color: var(--muted); margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -126,6 +134,10 @@ svg text { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nu
     <h2>Ranking</h2>
     <p class="sub">Score = p95 + 2 × jitter + 50 ms por cada 1 % de pérdida. Menor es mejor. Para RTMP (TCP) la pérdida y los picos pesan más que la latencia media.</p>
     <div class="card tablewrap"><table id="rank"></table></div>
+
+    <h2>Auditoría de red</h2>
+    <p class="sub">Parones en los que todos los destinos se retrasan a la vez (algo en la oficina retiene el tráfico), línea de salida a internet y camino salto a salto hacia el servidor.</p>
+    <div id="audit" class="audit"></div>
 
     <h2>Evolución</h2>
     <p class="sub">Misma escala en todos los paneles. Los picos que aparecen a la vez en el router o en internet y en AWS son de la red de la oficina.</p>
@@ -181,6 +193,8 @@ async function load() {
     const r = await fetch("/api/data?window=" + win);
     if (!r.ok) throw new Error(await r.text());
     data = await r.json();
+    data.allTargets = data.targets;
+    data.targets = data.targets.filter(t => t.kind !== "self");
     render();
     $("#updated").textContent = "Actualizado " + new Date(data.generated * 1000).toLocaleTimeString("es-ES") + " · se refresca cada minuto.";
   } catch (e) {
@@ -200,8 +214,86 @@ const name = id => (data.targets.find(t => t.id === id) || { name: id }).name;
 function render() {
   renderVerdict();
   renderRank();
+  renderAudit();
   renderMultiples();
   renderHeat();
+}
+
+// ---------- auditoría de red
+const fmtTs = ts => new Date(ts * 1000).toLocaleString("es-MX", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+
+function tile(label, value, note) {
+  const d = el("div", { class: "card tile" });
+  d.append(el("div", { class: "note" }, label), el("div", { class: "tile-v" }, value));
+  if (note) d.append(el("div", { class: "note" }, note));
+  return d;
+}
+
+function table(headers, rows) {
+  const t = el("table"), hr = el("tr");
+  headers.forEach(h => hr.append(el("th", {}, h)));
+  t.append(hr);
+  for (const r of rows) { const tr = el("tr"); r.forEach(c => tr.append(el("td", {}, c))); t.append(tr); }
+  return t;
+}
+
+function renderAudit() {
+  const box = $("#audit"); box.replaceChildren();
+  const a = data.audit; if (!a) return;
+  const st = a.sync_stalls;
+  const tiles = el("div", { class: "tiles" });
+  const ritmo = st.median_gap_s == null ? "" : st.regular
+    ? `Se repiten cada ~${Math.round(st.median_gap_s / 60)} min, con ritmo fijo: apunta a una tarea programada.`
+    : `Separación mediana de ${Math.round(st.median_gap_s / 60)} min, sin ritmo fijo.`;
+  tiles.append(tile("Parones simultáneos de red", String(st.count),
+    st.count ? `+${Math.round(st.median_added_ms)} ms de mediana. ${ritmo}` : "Ningún momento en que todos los destinos se retrasen a la vez."));
+  const e = a.egress;
+  if (e.current) {
+    const c = e.current;
+    tiles.append(tile("Salida a internet", c.ip || "—",
+      `${c.asname || "proveedor desconocido"} · Cloudflare ${c.colo || "—"} · ${Math.max(0, e.changes.length - 1)} cambios en la ventana`));
+  } else {
+    tiles.append(tile("Salida a internet", "—", "Aún sin datos (se mide cada 2 min)."));
+  }
+  for (const p of a.icmp_vs_tcp) {
+    const policed = p.icmp_loss > 0.005 && p.tcp_loss < p.icmp_loss / 5;
+    tiles.append(tile(`${name(p.icmp)}: ping vs TCP`, `${pc(p.icmp_loss)} / ${pc(p.tcp_loss)}`,
+      policed ? "Solo pierde el ping: el firewall lo limita o bloquea, no es pérdida real." : "Pérdida comparable por ping y por TCP."));
+  }
+  box.append(tiles);
+
+  if (st.count) {
+    box.append(el("h3", {}, "Parones por hora del día"));
+    const max = Math.max(...st.per_hour, 1);
+    const bars = el("div", { class: "hours" });
+    st.per_hour.forEach((n, h) => {
+      const b = el("div", { class: "hour", title: `${h}:00 · ${n} parones` });
+      const fill = el("i"); fill.style.height = (n ? 4 + 46 * n / max : 0) + "px";
+      b.append(fill, el("span", {}, String(h)));
+      bars.append(b);
+    });
+    box.append(bars);
+    box.append(el("h3", {}, "Últimos parones"));
+    box.append(el("div", { class: "tablewrap" }, null));
+    box.lastChild.append(table(["Cuándo", "Retraso añadido", "Mac verificado"],
+      st.events.slice(-15).reverse().map(([ts, add, v]) => [fmtTs(ts), ms(add), v ? "sí" : "sin datos"])));
+  }
+
+  if (e.changes.length > 1) {
+    box.append(el("h3", {}, "Cambios de línea de salida"));
+    const w = el("div", { class: "tablewrap" });
+    w.append(table(["Desde", "IP pública", "Proveedor", "Cloudflare"],
+      e.changes.slice().reverse().map(c => [fmtTs(c.ts), c.ip, `${c.asn || ""} ${c.asname || ""}`.trim(), c.colo || "—"])));
+    box.append(w);
+  }
+
+  for (const [tid, p] of Object.entries(a.paths)) {
+    const tn = (data.allTargets.find(t => t.id === tid) || { name: tid }).name;
+    box.append(el("h3", {}, `Ruta hacia ${tn} · ${fmtTs(p.latest.ts)} · ${p.changes.length} cambios de camino`));
+    const w = el("div", { class: "tablewrap" });
+    w.append(table(["Salto", "IP", "ms"], p.latest.hops.map(([n, ip, t]) => [String(n), ip || "* (no contesta)", ms(t)])));
+    box.append(w);
+  }
 }
 
 function renderVerdict() {
@@ -235,10 +327,10 @@ function renderVerdict() {
     warns.push([`${name(id)} no responde desde esta máquina. `, "Probablemente el Security Group o una whitelist solo admite al encoder: añade la IP pública de esta máquina en el puerto RTMP. Mientras tanto el diagnóstico usa las regiones."]);
   for (const id of (v.ignored_controls || []))
     warns.push([`${name(id)} no responde a ping. `, id === "gateway"
-      ? "Se excluye del diagnóstico. Suele ser el permiso de Red local de macOS: Ajustes del Sistema → Privacidad y seguridad → Red local → activa python3 (o Terminal). Si ya está activado, es el router el que filtra el ping."
+      ? "Se excluye del diagnóstico. Lo normal es que el firewall bloquee el ping hacia sí mismo; el monitor lo mide también por TCP («Router oficina (TCP)»). Si tampoco responde por TCP, pide a IT que permita ping desde la IP del Mac mini."
       : "Se excluye del diagnóstico."]);
-  if (data.stalled_rounds)
-    warns.push([`${data.stalled_rounds} rondas descartadas. `, "El propio equipo se congeló (todos los destinos dieron el mismo retraso a la vez). No es la red; si pasa mucho, revisa que el Mac mini no entre en reposo."]);
+  if (data.audit && data.audit.mac_pauses)
+    warns.push([`${data.audit.mac_pauses} rondas descartadas. `, "El propio Mac mini estuvo parado en esas rondas, así que su retraso no es de la red."]);
   if (warns.length) {
     const w = el("div", { class: "warn" });
     for (const [b, t] of warns) { const p = el("div"); p.append(el("b", {}, b), document.createTextNode(t)); w.append(p); }

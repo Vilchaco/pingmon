@@ -85,11 +85,14 @@ if not rows:
 for target, n, ok in rows:
     print("  %-14s %s" % (target, "OK" if ok else "SIN RESPUESTA"))
 bad = {t for t, n, ok in rows if not ok}
-if "gateway" in bad:
+if "gateway" in bad and "gateway-tcp" not in bad:
     print()
-    print("  El router no responde. Casi siempre es el permiso de Red local de macOS:")
-    print("  Ajustes del Sistema > Privacidad y seguridad > Red local > activa python3 (y Terminal).")
-    print("  Después ejecuta de nuevo este instalador.")
+    print("  El router no contesta al ping pero sí por TCP: su firewall bloquea el ping. Es normal;")
+    print("  el monitor usa la medición por TCP.")
+elif "gateway" in bad:
+    print()
+    print("  El router no contesta ni al ping ni por TCP. Pide a IT que permita ping (ICMP)")
+    print("  desde la IP de este Mac hacia el router/firewall.")
 if "server" in bad:
     print()
     print("  El servidor RTMP no responde en el puerto configurado desde este equipo.")

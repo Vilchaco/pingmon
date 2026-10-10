@@ -10,6 +10,13 @@ Mide continuamente la latencia y la pérdida desde la oficina hacia las regiones
 | Servidor RTMP actual | Tiempo de conexión TCP a `host:1935` | Medir el camino real de la señal |
 | Router de la oficina | ICMP al gateway por defecto (se detecta solo) | **Control**: si el lag aparece aquí, el problema está en la LAN o el Wi-Fi |
 | Internet (1.1.1.1) | ICMP | **Control**: si aparece aquí y no en el router, el problema es la línea o el ISP |
+| Router e internet por TCP | TCP al router (primer puerto que conteste) y a `1.1.1.1:443` | Si el ping pierde paquetes y TCP no, el firewall está limitando el ping y esa pérdida no es real |
+| Este Mac (pausas) | Pausa más larga del propio Mac durante cada ronda | Descarta las rondas en que el Mac estuvo parado, para no culpar a la red |
+
+**Auditoría de red** (sección del dashboard y del resumen JSON):
+- **Parones simultáneos:** momentos en que todos los destinos se retrasan a la vez con el mismo retraso, señal de que un equipo de la oficina (firewall, switch) retuvo el tráfico. Se cuentan por día y por hora, con la separación típica entre ellos: si es fija, apunta a una tarea programada.
+- **Línea de salida:** IP pública, proveedor y punto de Cloudflare cada 2 min. Detecta si la oficina cambia de línea o de proveedor.
+- **Rutas:** traceroute al servidor y a mx-central-1 cada 15 min, con los cambios de camino.
 
 Cada sonda que no responde en 1 s cuenta como **pérdida**. Si se pierde un SYN, TCP lo reenvía al cabo de ~1 s, y para una emisión en directo eso ya es un corte.
 
@@ -35,7 +42,7 @@ El instalador:
 
 Para actualizar, vuelve a ejecutar la misma línea: descarga la última versión y conserva tu `config.json`.
 
-Al terminar, el instalador espera 30 s y comprueba que cada destino responde. Si el **router sale «SIN RESPUESTA»**, casi siempre es el permiso de Red local de macOS: ve a **Ajustes del Sistema → Privacidad y seguridad → Red local**, activa python3 (y Terminal) y vuelve a ejecutar el instalador.
+Al terminar, el instalador espera 30 s y comprueba que cada destino responde. Es normal que el router no conteste al ping: muchos firewalls lo bloquean, y por eso el monitor también lo mide por TCP.
 
 Para que sobreviva a cortes de luz y reinicios, en el Mac mini:
 - **Ajustes del Sistema → Energía** → activa «Arrancar automáticamente tras un corte de luz».
@@ -56,7 +63,7 @@ python3 ~/pingmon/pingmon.py report --window 7d
 - **Conecta el Mac mini por cable** a la misma red desde la que emite el encoder. Si mides por Wi-Fi, el lag del Wi-Fi contamina la medida.
 - **Déjalo varios días, incluyendo días de emisión.** Lo más útil es el mapa de calor por hora del día y comparar las horas con emisión con las horas sin ella.
 - El dashboard es accesible desde la red de la oficina (`"bind": "0.0.0.0"`). Para limitarlo al propio Mac mini, pon `"127.0.0.1"`.
-- Si el router no responde a ping, el dashboard lo avisa y lo excluye del diagnóstico. Revisa primero el permiso de Red local (ver arriba). Si aun así no responde, puede que el router filtre el ping: prueba con `"method": "tcp", "port": 80` (o 53) en `config.json`.
+- Si el router no responde ni al ping ni por TCP, pide a IT que permita ping (ICMP) desde la IP del Mac mini.
 - La sonda del servidor RTMP abre y cierra una conexión TCP cada 10 s. En los logs del servidor saldrán como conexiones cortas; es normal.
 
 ## Configuración (`config.json`)

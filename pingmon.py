@@ -41,6 +41,22 @@ PLIST_PATH = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % LAUNCHD_LABE
 PLACEHOLDER_HOSTS = ("CAMBIAR", "")
 DNS_TTL = 300
 
+# Objetivos de auditoría que se añaden aunque la config.json instalada sea antigua.
+AUTO_TARGETS = [
+    # Pausas del propio Mac durante cada ronda: separa "se congeló el Mac" de "se paró la red".
+    {"id": "self", "name": "Este Mac (pausas)", "kind": "self", "method": "self", "host": "local"},
+    # El mismo router y el mismo 1.1.1.1 por TCP: si TCP no pierde y el ping sí, el firewall limita ICMP.
+    {"id": "gateway-tcp", "name": "Router oficina (TCP)", "kind": "control", "method": "tcp-auto", "host": "auto"},
+    {"id": "internet-tcp", "name": "Internet (1.1.1.1 TCP)", "kind": "control", "method": "tcp", "host": "1.1.1.1", "port": 443},
+]
+AUTO_PORTS = (443, 80, 53, 22, 8443, 8080)
+
+AUDIT_DEFAULTS = {
+    "egress_every_seconds": 120,       # IP pública de salida y proveedor
+    "trace_every_seconds": 900,        # traceroute
+    "trace_targets": ["server", "mx-central-1"],
+}
+
 
 def log(msg):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
@@ -55,7 +71,12 @@ def load_config():
         if any(host.startswith(p) for p in PLACEHOLDER_HOSTS if p) or not host:
             continue  # objetivo sin configurar (p. ej. servidor RTMP pendiente)
         targets.append(t)
+    have = {t["id"] for t in cfg["targets"]}
+    for t in AUTO_TARGETS:
+        if t["id"] not in have:
+            targets.append(dict(t, auto=True))
     cfg["active_targets"] = targets
+    cfg["audit"] = dict(AUDIT_DEFAULTS, **cfg.get("audit", {}))
     return cfg
 
 
@@ -71,6 +92,10 @@ def db_connect():
     )
     conn.execute("CREATE INDEX IF NOT EXISTS samples_target_ts ON samples(target, ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts)")
+    conn.execute("CREATE TABLE IF NOT EXISTS egress ("
+                 " ts REAL NOT NULL, ip TEXT, colo TEXT, asn TEXT, asname TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS traces ("
+                 " ts REAL NOT NULL, target TEXT NOT NULL, ip TEXT, hops TEXT)")
     return conn
 
 
@@ -118,6 +143,45 @@ def probe_tcp(ip, port, timeout):
         s.close()
 
 
+_auto_port = {}  # ip -> (puerto que responde o None, ts del último escaneo)
+
+
+def probe_tcp_auto(ip, timeout):
+    """TCP a un equipo de la red (router/firewall) probando puertos hasta que uno conteste.
+
+    Vale tanto SYN/ACK como RST: los dos son respuesta del equipo.
+    """
+    port, scanned = _auto_port.get(ip, (None, 0))
+    if port is not None:
+        rtt = probe_tcp(ip, port, timeout)
+        if rtt is not None or time.time() - scanned < 600:
+            return rtt
+    elif time.time() - scanned < 600:
+        return None
+    for p in AUTO_PORTS:
+        rtt = probe_tcp(ip, p, 0.3)
+        if rtt is not None:
+            _auto_port[ip] = (p, time.time())
+            return rtt
+    _auto_port[ip] = (None, time.time())
+    return None
+
+
+def watch_pauses(done, limit):
+    """Mide la mayor pausa del propio Mac mientras dura la ronda.
+
+    Duerme a intervalos de 5 ms; si una vuelta tarda mucho más, el Mac (CPU,
+    reposo, planificador) estuvo parado y cualquier retraso de esa ronda es suyo.
+    """
+    worst, last, end = 0.0, time.perf_counter(), time.perf_counter() + limit
+    while not done.is_set() and time.perf_counter() < end:
+        time.sleep(0.005)
+        now = time.perf_counter()
+        worst = max(worst, (now - last) * 1000 - 5)
+        last = now
+    return max(worst, 0.0)
+
+
 PING_RE = re.compile(r"time[=<]([\d.]+)\s*ms")
 
 
@@ -133,12 +197,16 @@ def probe_icmp(ip, timeout):
 
 
 def probe_target(t, timeout):
+    if t.get("method") == "self":
+        return None, None, None  # se mide aparte, en watch_pauses
     try:
         ip = resolve(t["host"])
     except Exception as e:  # DNS caído cuenta como pérdida
         return None, None, str(e)
     if t.get("method") == "icmp":
         rtt = probe_icmp(ip, timeout)
+    elif t.get("method") == "tcp-auto":
+        rtt = probe_tcp_auto(ip, timeout)
     else:
         rtt = probe_tcp(ip, int(t.get("port", 443)), timeout)
     return rtt, ip, None
@@ -157,14 +225,23 @@ def probe_loop(stop=None):
     if skipped:
         log("sin configurar (se ignoran): %s" % ", ".join(skipped))
 
-    pool = ThreadPoolExecutor(max_workers=max(1, len(targets)))
+    for name, fn in (("salida", egress_loop), ("traceroute", trace_loop)):
+        threading.Thread(target=_audit_thread, args=(name, fn, cfg, stop), daemon=True).start()
+
+    pool = ThreadPoolExecutor(max_workers=max(1, len(targets)) + 1)
     next_tick = time.time()
     last_prune = 0
     while not (stop and stop.is_set()):
         ts = time.time()
+        done = threading.Event()
+        pauses = pool.submit(watch_pauses, done, timeout + 1.5)
         results = list(pool.map(lambda t: probe_target(t, timeout), targets))
+        done.set()
+        pause_ms = pauses.result()
         rows = []
         for t, (rtt, ip, err) in zip(targets, results):
+            if t.get("method") == "self":
+                rtt = pause_ms
             rows.append((ts, t["id"], rtt, ip))
             if err:
                 log("%s: %s" % (t["id"], err))
@@ -172,7 +249,8 @@ def probe_loop(stop=None):
             conn.executemany("INSERT INTO samples VALUES (?,?,?,?)", rows)
             conn.commit()
             if ts - last_prune > 3600:
-                conn.execute("DELETE FROM samples WHERE ts < ?", (ts - retention,))
+                for table in ("samples", "egress", "traces"):
+                    conn.execute("DELETE FROM %s WHERE ts < ?" % table, (ts - retention,))
                 conn.commit()
                 last_prune = ts
         except sqlite3.Error as e:
@@ -186,6 +264,98 @@ def probe_loop(stop=None):
             stop.wait(delay)
         else:
             time.sleep(delay)
+
+
+def _audit_thread(name, fn, cfg, stop):
+    # Un fallo de la auditoría nunca debe parar las mediciones de latencia.
+    while not (stop and stop.is_set()):
+        try:
+            fn(cfg, stop)
+        except Exception as e:
+            log("auditoría (%s): %r" % (name, e))
+        time.sleep(60)
+
+
+def _wait(stop, seconds):
+    if stop:
+        stop.wait(seconds)
+    else:
+        time.sleep(seconds)
+
+
+def egress_loop(cfg, stop):
+    """IP pública por la que sale la oficina y su proveedor (AS)."""
+    import urllib.request
+    conn = db_connect()
+    every = float(cfg["audit"]["egress_every_seconds"])
+    last_ip, asn, asname = None, None, None
+    while not (stop and stop.is_set()):
+        ip = colo = None
+        try:
+            body = urllib.request.urlopen("https://1.1.1.1/cdn-cgi/trace", timeout=10).read().decode()
+            kv = dict(line.split("=", 1) for line in body.splitlines() if "=" in line)
+            ip, colo = kv.get("ip"), kv.get("colo")
+        except Exception:
+            pass  # sin respuesta: se guarda como fila vacía (salida caída)
+        if ip and ip != last_ip:
+            asn, asname = whois_as(ip)
+            last_ip = ip
+        conn.execute("INSERT INTO egress VALUES (?,?,?,?,?)",
+                     (time.time(), ip, colo, asn if ip else None, asname if ip else None))
+        conn.commit()
+        _wait(stop, every)
+
+
+def whois_as(ip):
+    """Proveedor de una IP pública (Team Cymru)."""
+    try:
+        out = subprocess.run(["/usr/bin/whois", "-h", "whois.cymru.com", " -v " + ip],
+                             capture_output=True, text=True, timeout=20).stdout
+        cols = [c.strip() for c in out.strip().splitlines()[-1].split("|")]
+        asn = "AS" + cols[0]
+        name = cols[-1]
+        if name.startswith(asn + " - "):  # Cymru a veces repite el número delante del nombre
+            name = name[len(asn) + 3:]
+        return asn, name
+    except Exception:
+        return None, None
+
+
+HOP_RE = re.compile(r"^\s*(\d+)\s+(.*)$")
+IP_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+MS_RE = re.compile(r"([\d.]+)\s*ms")
+
+
+def parse_traceroute(out):
+    hops = []
+    for line in out.splitlines():
+        m = HOP_RE.match(line)
+        if not m:
+            continue
+        rest = m.group(2)
+        ips = IP_RE.findall(rest)
+        ms = [float(x) for x in MS_RE.findall(rest)]
+        hops.append([int(m.group(1)), ips[0] if ips else None, min(ms) if ms else None])
+    return hops
+
+
+def trace_loop(cfg, stop):
+    conn = db_connect()
+    every = float(cfg["audit"]["trace_every_seconds"])
+    by_id = {t["id"]: t for t in cfg["active_targets"]}
+    wanted = [by_id[i] for i in cfg["audit"]["trace_targets"] if i in by_id]
+    while not (stop and stop.is_set()):
+        for t in wanted:
+            try:
+                ip = resolve(t["host"])
+                out = subprocess.run(["/usr/sbin/traceroute", "-n", "-q", "2", "-w", "1", "-m", "20", ip],
+                                     capture_output=True, text=True, timeout=120).stdout
+                conn.execute("INSERT INTO traces VALUES (?,?,?,?)",
+                             (time.time(), t["id"], ip, json.dumps(parse_traceroute(out))))
+                conn.commit()
+            except Exception as e:
+                log("traceroute %s: %r" % (t["id"], e))
+        _wait(stop, every)
 
 
 def _probe_or_die():
@@ -262,10 +432,10 @@ def analyze(window_s):
             by_target[tid].append((ts, rtt))
     conn.close()
 
-    stalled = stalled_rounds(targets, by_target)
-    if stalled:
+    mac_pauses, net_stalls = classify_stalls(targets, by_target)
+    if mac_pauses:  # solo se descartan las rondas en que el Mac estuvo parado
         for tid in by_target:
-            by_target[tid] = [r for r in by_target[tid] if r[0] not in stalled]
+            by_target[tid] = [r for r in by_target[tid] if r[0] not in mac_pauses]
 
     summary, series, heat, buckets_raw = {}, {}, {}, {}
     for t in targets:
@@ -298,36 +468,115 @@ def analyze(window_s):
         "series": series,
         "heatmap": heat,
         "verdict": verdict(targets, summary, buckets_raw, nb),
-        "stalled_rounds": len(stalled),
+        "audit": audit(targets, summary, start, mac_pauses, net_stalls),
     }
 
 
-def stalled_rounds(targets, by_target):
-    """Rondas en las que el propio equipo se congeló, no la red.
+MAC_PAUSE_MS = 20
 
-    Si varios destinos TCP con latencias normales distintas (p. ej. 40 y 65 ms)
-    devuelven a la vez casi el mismo RTT (±2 ms) y todos por encima de lo normal,
-    el retraso es del Mac (suspensión, CPU), no de ningún camino de red.
+
+def classify_stalls(targets, by_target):
+    """Separa las pausas del propio Mac de los parones de la red.
+
+    Parón simultáneo: varios destinos con latencias normales distintas (p. ej. 30 y
+    80 ms) contestan a la vez con casi el mismo RTT (±2 ms) y por encima de lo normal.
+    Eso solo pasa si algo retuvo las respuestas y las soltó de golpe: o el Mac estuvo
+    parado, o un equipo de la red (firewall, switch). La sonda "self" mide las pausas
+    del Mac en esa misma ronda y decide cuál de las dos fue.
+
+    Devuelve (rondas con el Mac parado, [(ts, retraso añadido ms, verificado)]).
     """
-    tcp = [t["id"] for t in targets if t.get("method", "tcp") == "tcp"]
+    pauses = {ts: v for ts, v in by_target.get("self", [])}
+    mac = {ts for ts, v in pauses.items() if v is None or v > MAC_PAUSE_MS}
+    tcp = [t["id"] for t in targets if t.get("method", "tcp") in ("tcp", "tcp-auto")]
     base = {}
     for tid in tcp:
-        ok = sorted(r for _, r in by_target[tid] if r is not None)
-        base[tid] = pct(ok, 50)
+        base[tid] = pct(sorted(r for _, r in by_target[tid] if r is not None), 50)
     rounds = {}
     for tid in tcp:
         for ts, rtt in by_target[tid]:
             if rtt is not None and base[tid]:
                 rounds.setdefault(ts, []).append((rtt, base[tid]))
-    out = set()
-    for ts, vals in rounds.items():
-        if len(vals) < 3:
+    net = []
+    for ts, vals in sorted(rounds.items()):
+        if len(vals) < 3 or ts in mac:
             continue
         rtts = [v for v, _ in vals]
         bases = [b for _, b in vals]
         if (max(rtts) - min(rtts) <= 2.0 and max(bases) - min(bases) >= 10
                 and all(v > b + 15 for v, b in vals)):
-            out.add(ts)
+            added = sorted(v - b for v, b in vals)[len(vals) // 2]
+            net.append((ts, added, ts in pauses))
+    return mac, net
+
+
+def audit(targets, summary, start, mac_pauses, net_stalls):
+    out = {"mac_pauses": len(mac_pauses)}
+
+    # Parones simultáneos: cuántos, cuándo y si se repiten con un ritmo fijo.
+    per_day, per_hour = {}, [0] * 24
+    for ts, _, _ in net_stalls:
+        lt = time.localtime(ts)
+        day = time.strftime("%Y-%m-%d", lt)
+        per_day[day] = per_day.get(day, 0) + 1
+        per_hour[lt.tm_hour] += 1
+    gaps = [b[0] - a[0] for a, b in zip(net_stalls, net_stalls[1:])]
+    med = sorted(gaps)[len(gaps) // 2] if gaps else None
+    regular = None
+    if len(gaps) >= 5:
+        near = sum(1 for g in gaps if abs(g - med) <= 0.15 * med)
+        regular = near >= 0.5 * len(gaps)
+    out["sync_stalls"] = {
+        "count": len(net_stalls),
+        "verified": sum(1 for _, _, v in net_stalls if v),
+        "median_added_ms": sorted(a for _, a, _ in net_stalls)[len(net_stalls) // 2] if net_stalls else None,
+        "median_gap_s": med,
+        "regular": regular,
+        "per_day": per_day,
+        "per_hour": per_hour,
+        "events": [[round(ts, 1), round(a, 1), v] for ts, a, v in net_stalls[-500:]],
+    }
+
+    # Mismo destino por ICMP y por TCP: si solo pierde el ping, el firewall lo está limitando.
+    pairs = []
+    for icmp, tcp in (("gateway", "gateway-tcp"), ("internet", "internet-tcp")):
+        if icmp in summary and tcp in summary and summary[icmp]["n"] and summary[tcp]["n"]:
+            pairs.append({"icmp": icmp, "tcp": tcp,
+                          "icmp_loss": summary[icmp]["loss"], "tcp_loss": summary[tcp]["loss"]})
+    out["icmp_vs_tcp"] = pairs
+
+    conn = db_connect()
+    # Línea de salida: cambios de IP pública, proveedor o PoP de Cloudflare.
+    changes, prev, down = [], None, 0
+    rows = conn.execute("SELECT ts, ip, colo, asn, asname FROM egress WHERE ts >= ? ORDER BY ts",
+                        (start,)).fetchall()
+    for ts, ip, colo, asn, asname in rows:
+        if ip is None:
+            down += 1
+            continue
+        key = (ip, colo)
+        if key != prev:
+            changes.append({"ts": ts, "ip": ip, "colo": colo, "asn": asn, "asname": asname})
+            prev = key
+    out["egress"] = {"checks": len(rows), "failed": down,
+                     "current": changes[-1] if changes else None, "changes": changes[-50:]}
+
+    # Rutas: último traceroute y cambios de camino (ignorando saltos que no contestan).
+    paths = {}
+    for (tid,) in conn.execute("SELECT DISTINCT target FROM traces WHERE ts >= ?", (start,)):
+        traces = conn.execute("SELECT ts, ip, hops FROM traces WHERE target = ? AND ts >= ? ORDER BY ts",
+                              (tid, start)).fetchall()
+        changes, prev = [], None
+        for ts, ip, hops in traces:
+            sig = [h[1] for h in json.loads(hops) if h[1]]
+            if prev is not None and sig != prev:
+                changes.append({"ts": ts, "from": prev, "to": sig})
+            prev = sig
+        ts, ip, hops = traces[-1]
+        paths[tid] = {"latest": {"ts": ts, "ip": ip, "hops": json.loads(hops)},
+                      "count": len(traces), "changes": changes[-30:]}
+    conn.close()
+    out["paths"] = paths
     return out
 
 
@@ -340,8 +589,8 @@ def verdict(targets, summary, buckets, nb):
     # Un control que casi nunca responde (router que filtra ICMP) no sirve de referencia.
     controls = [i for i in ids("control") if summary[i]["loss"] <= 0.5]
     ignored = [i for i in ids("control") if i not in controls]
-    gw = [i for i in controls if i == "gateway"]
-    inet = [i for i in controls if i != "gateway"]
+    gw = [i for i in controls if i.startswith("gateway")]
+    inet = [i for i in controls if not i.startswith("gateway")]
     aws_ref = servers or regions
     if not aws_ref:
         return {"state": "nodata", "episodes": 0, "ignored_servers": ignored_servers}
@@ -476,7 +725,7 @@ def report(window):
         "objetivo", "p50", "p95", "p99", "max", "jitter", "pérd.", "score")
     print(hdr)
     print("-" * len(hdr))
-    order = sorted(d["targets"], key=lambda t: (
+    order = sorted((t for t in d["targets"] if t["kind"] != "self"), key=lambda t: (
         {"control": 0, "server": 1, "region": 2}[t["kind"]],
         d["summary"][t["id"]]["score"] or 1e9))
     for t in order:
@@ -501,10 +750,29 @@ def report(window):
         print("  Mejor región por score: %s" % names[v["best_region"]])
     if v.get("ignored_controls"):
         print("  Controles que no responden (ignorados): %s" % ", ".join(names[i] for i in v["ignored_controls"]))
-        if "gateway" in v["ignored_controls"]:
-            print("    -> Router: revisa Ajustes del Sistema > Privacidad y seguridad > Red local (activa python3/Terminal).")
-    if d.get("stalled_rounds"):
-        print("  %d rondas descartadas porque el propio equipo se congeló (no es la red)." % d["stalled_rounds"])
+    a = d["audit"]
+    print("\nAuditoría de red:")
+    st = a["sync_stalls"]
+    if st["count"]:
+        ritmo = ("cada ~%.0f min, con ritmo fijo" if st["regular"] else "cada ~%.0f min de mediana, sin ritmo fijo") % (st["median_gap_s"] / 60) if st["median_gap_s"] else ""
+        print("  Parones simultáneos de red: %d (%d verificados con el Mac activo), +%.0f ms de mediana. %s"
+              % (st["count"], st["verified"], st["median_added_ms"], ritmo))
+    else:
+        print("  Sin parones simultáneos de red.")
+    if a["mac_pauses"]:
+        print("  %d rondas descartadas porque el propio Mac estuvo parado (no es la red)." % a["mac_pauses"])
+    for p in a["icmp_vs_tcp"]:
+        print("  %s: pérdida por ping %.2f %% vs por TCP %.2f %%%s" % (
+            names[p["icmp"]], (p["icmp_loss"] or 0) * 100, (p["tcp_loss"] or 0) * 100,
+            "  -> el ping está limitado/bloqueado, no es pérdida real" if (p["icmp_loss"] or 0) > 0.005 and (p["tcp_loss"] or 0) < (p["icmp_loss"] or 0) / 5 else ""))
+    e = a["egress"]
+    if e["current"]:
+        c = e["current"]
+        print("  Salida a internet: %s (%s %s), Cloudflare %s. Cambios en la ventana: %d. Comprobaciones fallidas: %d/%d."
+              % (c["ip"], c["asn"], c["asname"], c["colo"], max(0, len(e["changes"]) - 1), e["failed"], e["checks"]))
+    for tid, p in a["paths"].items():
+        print("  Ruta a %s: %d saltos, %d cambios de camino en %d traceroutes." % (
+            names.get(tid, tid), len(p["latest"]["hops"]), len(p["changes"]), p["count"]))
     for i in v.get("ignored_servers", []):
         print("  %s no responde desde esta máquina (¿Security Group / whitelist?); se usan las regiones." % names[i])
     if d["unconfigured"]:
