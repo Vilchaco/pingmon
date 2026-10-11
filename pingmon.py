@@ -472,7 +472,7 @@ def analyze(window_s):
     }
 
 
-MAC_PAUSE_MS = 20
+MAC_FREEZE_MS = 200   # pausa del Mac tan larga que invalida la ronda aunque no haya parón
 
 
 def classify_stalls(targets, by_target):
@@ -481,13 +481,15 @@ def classify_stalls(targets, by_target):
     Parón simultáneo: varios destinos con latencias normales distintas (p. ej. 30 y
     80 ms) contestan a la vez con casi el mismo RTT (±2 ms) y por encima de lo normal.
     Eso solo pasa si algo retuvo las respuestas y las soltó de golpe: o el Mac estuvo
-    parado, o un equipo de la red (firewall, switch). La sonda "self" mide las pausas
-    del Mac en esa misma ronda y decide cuál de las dos fue.
+    parado, o un equipo de la red (firewall, switch). La sonda "self" mide la pausa
+    más larga del Mac en esa misma ronda: si cubre la mayor parte del retraso, fue el
+    Mac; si no, fue la red. (macOS retrasa algo los temporizadores de los procesos en
+    segundo plano, así que se compara con el retraso de la ronda, no con un umbral fijo.)
 
-    Devuelve (rondas con el Mac parado, [(ts, retraso añadido ms, verificado)]).
+    Devuelve (rondas descartadas por el Mac, [(ts, retraso añadido ms, verificado)]).
     """
-    pauses = {ts: v for ts, v in by_target.get("self", [])}
-    mac = {ts for ts, v in pauses.items() if v is None or v > MAC_PAUSE_MS}
+    pauses = {ts: v for ts, v in by_target.get("self", []) if v is not None}
+    mac = {ts for ts, v in pauses.items() if v > MAC_FREEZE_MS}
     tcp = [t["id"] for t in targets if t.get("method", "tcp") in ("tcp", "tcp-auto")]
     base = {}
     for tid in tcp:
@@ -506,7 +508,10 @@ def classify_stalls(targets, by_target):
         if (max(rtts) - min(rtts) <= 2.0 and max(bases) - min(bases) >= 10
                 and all(v > b + 15 for v, b in vals)):
             added = sorted(v - b for v, b in vals)[len(vals) // 2]
-            net.append((ts, added, ts in pauses))
+            if ts in pauses and pauses[ts] >= 0.7 * added:
+                mac.add(ts)  # el Mac estuvo parado casi todo el retraso: no es la red
+            else:
+                net.append((ts, added, ts in pauses))
     return mac, net
 
 
@@ -793,6 +798,7 @@ PLIST = """<?xml version="1.0" encoding="UTF-8"?>
     <string>{python}</string><string>{script}</string><string>run</string>
   </array>
   <key>WorkingDirectory</key><string>{base}</string>
+  <key>ProcessType</key><string>Interactive</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>{log}</string>
