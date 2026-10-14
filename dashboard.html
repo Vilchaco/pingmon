@@ -77,6 +77,7 @@ th:first-child, td:first-child { text-align: left; }
 tr.group td { color: var(--muted); font-size: 12px; padding-top: 14px; border-bottom: 0; }
 .badge { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 6px; margin-left: 6px; border: 1px solid var(--border); color: var(--ink-2); }
 .bad { color: var(--critical); font-weight: 600; }
+.mini.dead { opacity: .75; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
 .mini h3 { margin: 0; font-size: 13px; font-weight: 600; }
 .mini .meta { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
@@ -140,11 +141,17 @@ svg text { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nu
     <div id="audit" class="audit"></div>
 
     <h2>Evolución</h2>
-    <p class="sub">Misma escala en todos los paneles. Los picos que aparecen a la vez en el router o en internet y en AWS son de la red de la oficina.</p>
+    <p class="sub">Por defecto cada panel usa su propia escala para que se vean sus variaciones; «Misma escala» sirve para comparar destinos. Los picos que aparecen a la vez en internet y en AWS son de la red de la oficina.</p>
+    <div class="bar" style="margin:8px 0">
+      <div class="seg" id="scale" role="group" aria-label="Escala de los gráficos">
+        <button data-s="own">Escala propia</button><button data-s="shared">Misma escala</button>
+      </div>
+    </div>
     <div class="legend">
       <span><svg class="key" viewBox="0 0 16 8" height="8"><line x1="0" y1="4" x2="16" y2="4" stroke="var(--series)" stroke-width="2"/></svg>mediana (p50)</span>
       <span><svg class="key" viewBox="0 0 16 8" height="8"><rect width="16" height="8" rx="2" fill="var(--band)"/></svg>p50–p95</span>
-      <span><svg class="key" viewBox="0 0 16 8" height="8"><rect x="6" width="4" height="8" rx="1" fill="var(--critical)"/></svg>pérdida (sin respuesta en 1 s)</span>
+      <span><svg class="key" viewBox="0 0 16 8" height="8"><rect x="6" width="4" height="8" rx="1" fill="var(--critical)"/></svg>pérdida, en la franja bajo el gráfico (sin respuesta en 1 s)</span>
+      <span><svg class="key" viewBox="0 0 16 8" height="8"><path d="M4 7 L8 1 L12 7 Z" fill="var(--ink-2)"/></svg>pico fuera de escala</span>
     </div>
     <div class="grid" id="multiples"></div>
 
@@ -180,8 +187,9 @@ let data = null;
 function fmtTime(ts, window) {
   const d = new Date(ts * 1000);
   const hm = d.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
-  if (window <= 86400) return hm;
-  return d.toLocaleDateString("es-ES", { day: "numeric", month: "short" }) + " " + hm;
+  if (window < 86400) return hm;
+  if (window <= 86400 * 2) return d.toLocaleDateString("es-ES", { weekday: "short" }) + " " + hm;
+  return d.toLocaleDateString("es-ES", { weekday: "short", day: "numeric" }) + " " + hm;
 }
 
 async function load() {
@@ -364,34 +372,75 @@ function renderRank() {
 }
 
 // ---------- small multiples with a synced crosshair
-const W = 340, H = 120, M = { l: 34, r: 6, t: 6, b: 18 };
+const W = 340, H = 128, M = { l: 34, r: 6, t: 8, b: 30 }, STRIP = 7;
 let panels = [];
+let scaleMode = "own";
+try { scaleMode = localStorage.getItem("pingmon.scale") || scaleMode; } catch (e) {}
+document.querySelectorAll("#scale button").forEach(b => b.addEventListener("click", () => {
+  scaleMode = b.dataset.s;
+  try { localStorage.setItem("pingmon.scale", scaleMode); } catch (e) {}
+  if (data) renderMultiples();
+}));
+
+// Tope del eje: cubre casi todos los tramos pero no deja que un pico suelto aplaste la línea.
+function robustMax(ids) {
+  const p95s = [], p50s = [];
+  for (const id of ids) {
+    for (const v of data.series[id].p95) if (v != null) p95s.push(v);
+    for (const v of data.series[id].p50) if (v != null) p50s.push(v);
+  }
+  if (!p95s.length) return 50;
+  p95s.sort((a, b) => a - b);
+  const q = p95s[Math.min(p95s.length - 1, Math.floor(p95s.length * 0.97))];
+  return niceMax(Math.max(q * 1.2, Math.max(...p50s) * 1.15, 10));
+}
+
+const empty = id => !data.summary[id].n;
+const dead = id => empty(id) || data.summary[id].loss >= 0.95;
 
 function renderMultiples() {
+  document.querySelectorAll("#scale button").forEach(b => b.setAttribute("aria-pressed", b.dataset.s === scaleMode));
   const box = $("#multiples"); box.replaceChildren(); panels = [];
   const nb = data.series[data.targets[0]?.id]?.p50.length || 0;
   if (!nb) return;
-  // Escala común; limitada al p95 más alto para que un pico aislado no aplaste todo.
-  let ymax = 0;
-  for (const t of data.targets) for (const v of data.series[t.id].p95) if (v != null && data.summary[t.id].loss < 0.5) ymax = Math.max(ymax, v);
-  ymax = niceMax(ymax * 1.1 || 50);
-  const x = i => M.l + (W - M.l - M.r) * (i + 0.5) / nb;
-  const y = v => M.t + (H - M.t - M.b) * (1 - Math.min(v, ymax) / ymax);
   const order = ["control", "server", "region"];
-  const targets = [...data.targets].sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind));
+  const targets = [...data.targets].sort((a, b) =>
+    (dead(a.id) - dead(b.id)) || (order.indexOf(a.kind) - order.indexOf(b.kind)));
+  const shared = robustMax(targets.filter(t => !dead(t.id)).map(t => t.id));
+  const x = i => M.l + (W - M.l - M.r) * (i + 0.5) / nb;
+  const plotBottom = H - M.b;
 
   for (const t of targets) {
     const s = data.series[t.id], sum = data.summary[t.id];
     const card = el("div", { class: "card mini" });
-    card.append(el("h3", {}, t.name), el("div", { class: "meta" }, `p50 ${ms(sum.p50)} · p95 ${ms(sum.p95)} · pérdida ${pc(sum.loss)}`));
+    card.append(el("h3", {}, t.name));
+    if (dead(t.id)) {
+      // Sin respuesta en toda la ventana: un gráfico rojo entero no dice nada.
+      card.classList.add("dead");
+      if (empty(t.id)) {
+        card.append(el("div", { class: "meta" }, "Sin datos todavía en esta ventana."));
+        box.append(card);
+        continue;
+      }
+      card.append(el("div", { class: "meta" }, `No responde en esta ventana (${pc(sum.loss)} sin respuesta).`));
+      card.append(el("p", { class: "note", style: "margin:6px 0 0" }, t.id.startsWith("gateway")
+        ? "El firewall de la oficina no contesta a ping ni a TCP desde el Mac mini. No afecta a las demás mediciones."
+        : "Revisa que el destino acepte conexiones desde la oficina."));
+      box.append(card);
+      continue;
+    }
+    card.append(el("div", { class: "meta" }, `p50 ${ms(sum.p50)} · p95 ${ms(sum.p95)} · pérdida ${pc(sum.loss)}`));
+    const ymax = scaleMode === "shared" ? shared : robustMax([t.id]);
+    const y = v => M.t + (plotBottom - M.t) * (1 - Math.min(v, ymax) / ymax);
     const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `Latencia de ${t.name}` });
-    for (const f of [0, 0.5, 1]) {
+    for (const f of [0, 0.25, 0.5, 0.75, 1]) {
       const yy = y(ymax * f);
       svg.append(sv("line", { x1: M.l, x2: W - M.r, y1: yy, y2: yy, stroke: f === 0 ? "var(--axis)" : "var(--grid)", "stroke-width": 1 }));
+      if (f === 0.25 || f === 0.75) continue;
       const lab = sv("text", { x: M.l - 4, y: yy + 3, "text-anchor": "end" }); lab.textContent = Math.round(ymax * f); svg.append(lab);
     }
     for (const i of [0, Math.floor(nb / 2), nb - 1]) {
-      const lab = sv("text", { x: x(i), y: H - 4, "text-anchor": i === 0 ? "start" : i === nb - 1 ? "end" : "middle" });
+      const lab = sv("text", { x: x(i), y: H - 3, "text-anchor": i === 0 ? "start" : i === nb - 1 ? "end" : "middle" });
       lab.textContent = fmtTime(data.start + data.bucket * i, data.window); svg.append(lab);
     }
     // banda p50–p95 y línea p50, cortadas donde no hay datos
@@ -403,14 +452,18 @@ function renderMultiples() {
     }
     svg.append(sv("path", { d: band, fill: "var(--band)", opacity: 0.8 }));
     svg.append(sv("path", { d: line, fill: "none", stroke: "var(--series)", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
-    // pérdida: marcas en la base, altura según el % perdido
+    // picos que se salen de la escala: marca en el borde superior
+    s.p95.forEach((v, i) => {
+      if (v != null && v > ymax) svg.append(sv("path", { d: `M${x(i) - 3},${M.t + 5} L${x(i)},${M.t} L${x(i) + 3},${M.t + 5} Z`, fill: "var(--ink-2)" }));
+    });
+    // pérdida: franja propia bajo el eje, intensidad según el % perdido
     const bw = Math.max(2, (W - M.l - M.r) / nb - 1);
     s.loss.forEach((l, i) => {
       if (!l) return;
-      const h = 3 + 12 * Math.min(1, l / 0.2);
-      svg.append(sv("rect", { x: x(i) - bw / 2, y: H - M.b - h, width: bw, height: h, rx: 1, fill: "var(--critical)" }));
+      svg.append(sv("rect", { x: x(i) - bw / 2, y: plotBottom + 3, width: bw, height: STRIP, rx: 1,
+        fill: "var(--critical)", opacity: Math.min(1, 0.35 + l / 0.05) }));
     });
-    const cross = sv("line", { y1: M.t, y2: H - M.b, stroke: "var(--ink-2)", "stroke-width": 1, visibility: "hidden" });
+    const cross = sv("line", { y1: M.t, y2: plotBottom + 3 + STRIP, stroke: "var(--ink-2)", "stroke-width": 1, visibility: "hidden" });
     svg.append(cross);
     const hit = sv("rect", { x: M.l, y: 0, width: W - M.l - M.r, height: H, fill: "transparent", tabindex: 0 });
     svg.append(hit);
